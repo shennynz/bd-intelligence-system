@@ -1,7 +1,10 @@
-import { chromium } from 'playwright';
+import * as cheerio from 'cheerio';
 import type { CareersResult } from '../types';
 
 const CAREERS_PATHS = ['/careers', '/jobs', '/join', '/work-with-us'];
+
+const USER_AGENT =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 const ATS_PATTERNS: Record<string, RegExp> = {
   Lever: /lever\.co/i,
@@ -44,152 +47,155 @@ function classifyRole(title: string): string {
   return 'other';
 }
 
-// Browser-context scripts
-const FIND_CAREERS_LINK_SCRIPT = `(paths) => {
-  const allLinks = document.querySelectorAll('a[href]');
-  for (const link of allLinks) {
-    const href = link.href.toLowerCase();
-    for (const p of paths) {
-      if (href.includes(p)) return link.href;
+async function fetchHtml(url: string): Promise<{ html: string; finalUrl: string } | null> {
+  try {
+    const res = await fetch(url, {
+      headers: { 'User-Agent': USER_AGENT },
+      redirect: 'follow',
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) return null;
+    const html = await res.text();
+    return { html, finalUrl: res.url };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Find the careers page URL by scanning the homepage HTML for links,
+ * then falling back to direct path probing.
+ */
+async function findCareersUrl(baseUrl: string): Promise<string | null> {
+  // Step 1: Fetch homepage and look for careers links
+  const homepage = await fetchHtml(baseUrl);
+  if (homepage) {
+    const $ = cheerio.load(homepage.html);
+    for (const el of $('a[href]').toArray()) {
+      const href = ($(el).attr('href') || '').toLowerCase();
+      for (const path of CAREERS_PATHS) {
+        if (href.includes(path)) {
+          const raw = $(el).attr('href') || '';
+          // Resolve relative URLs
+          try {
+            return new URL(raw, baseUrl).href;
+          } catch {
+            return `${baseUrl}${raw}`;
+          }
+        }
+      }
     }
   }
-  return null;
-}`;
 
-const EXTRACT_ROLES_SCRIPT = `() => {
-  const titles = [];
+  // Step 2: Probe direct paths
+  for (const path of CAREERS_PATHS) {
+    const tryUrl = `${baseUrl}${path}`;
+    const result = await fetchHtml(tryUrl);
+    if (result) return result.finalUrl;
+  }
+
+  return null;
+}
+
+/**
+ * Extract role titles from careers page HTML using common selectors.
+ */
+function extractRoleTitles($: cheerio.CheerioAPI): string[] {
+  const titles: string[] = [];
+
+  // Try structured selectors first
   const selectors = [
     '[class*="job"] h3', '[class*="job"] h4',
     '[class*="position"] h3', '[class*="position"] h4',
     '[class*="opening"] h3', '[class*="opening"] a',
     '[class*="role"] h3', '[class*="role"] a',
-    'li h3', 'li h4', 'tr td:first-child',
     '.posting-title', '[data-qa="posting-name"]',
   ];
+
   for (const sel of selectors) {
-    const els = document.querySelectorAll(sel);
-    if (els.length > 0) {
-      els.forEach(el => {
-        const text = el.textContent?.trim();
-        if (text && text.length > 3 && text.length < 100) titles.push(text);
-      });
-      if (titles.length > 0) break;
-    }
-  }
-  if (titles.length === 0) {
-    const links = document.querySelectorAll('a');
-    for (const link of links) {
-      const href = link.href || '';
-      const text = link.textContent?.trim() || '';
-      if (text.length > 5 && text.length < 100 &&
-          (href.includes('/job') || href.includes('/position') || href.includes('/opening'))) {
+    $(sel).each((_, el) => {
+      const text = $(el).text().trim();
+      if (text.length > 3 && text.length < 100) {
         titles.push(text);
       }
-    }
+    });
+    if (titles.length > 0) return titles;
   }
+
+  // Fallback: links that look like job postings
+  $('a[href]').each((_, el) => {
+    const href = $(el).attr('href') || '';
+    const text = $(el).text().trim();
+    if (
+      text.length > 5 &&
+      text.length < 100 &&
+      (href.includes('/job') || href.includes('/position') || href.includes('/opening'))
+    ) {
+      titles.push(text);
+    }
+  });
+
+  // Fallback: h3/h4 inside list items (common careers page pattern)
+  if (titles.length === 0) {
+    $('li h3, li h4').each((_, el) => {
+      const text = $(el).text().trim();
+      if (text.length > 3 && text.length < 100) {
+        titles.push(text);
+      }
+    });
+  }
+
   return titles;
-}`;
+}
 
 /**
- * Crawl company careers page using Playwright.
+ * Crawl company careers page using HTTP fetch + cheerio.
  * Detects ATS, scrapes open roles, categorises by department.
  */
 export async function crawlCareersPage(
   companyUrl: string
 ): Promise<CareersResult | null> {
   const baseUrl = companyUrl.replace(/\/+$/, '');
-  const browser = await chromium.launch({ headless: true });
 
-  try {
-    const context = await browser.newContext({
-      userAgent:
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    });
-    const page = await context.newPage();
+  // Find the careers page
+  const careersUrl = await findCareersUrl(baseUrl);
+  if (!careersUrl) return null;
 
-    // Step 1: Load homepage and find careers link
-    let careersUrl: string | null = null;
+  // Fetch the careers page
+  const careersPage = await fetchHtml(careersUrl);
+  if (!careersPage) return null;
 
-    try {
-      await page.goto(baseUrl, {
-        waitUntil: 'domcontentloaded',
-        timeout: 15_000,
-      });
-      await page.waitForTimeout(1000 + Math.random() * 1000);
+  const html = careersPage.html;
+  const $ = cheerio.load(html);
 
-      const findLinkFn = new Function(`return (${FIND_CAREERS_LINK_SCRIPT})`)();
-      careersUrl = await page.evaluate(findLinkFn, CAREERS_PATHS) as string | null;
-    } catch {
-      // Homepage failed, try direct paths
+  // Detect ATS from page content and final URL
+  let atsDetected = 'none';
+  for (const [name, pattern] of Object.entries(ATS_PATTERNS)) {
+    if (pattern.test(html) || pattern.test(careersPage.finalUrl)) {
+      atsDetected = name;
+      break;
     }
-
-    // If no link found on homepage, try direct paths
-    if (!careersUrl) {
-      for (const careerPath of CAREERS_PATHS) {
-        const tryUrl = `${baseUrl}${careerPath}`;
-        try {
-          const resp = await page.goto(tryUrl, {
-            waitUntil: 'domcontentloaded',
-            timeout: 15_000,
-          });
-          if (resp && resp.status() < 400) {
-            careersUrl = tryUrl;
-            break;
-          }
-        } catch {
-          continue;
-        }
-      }
-    }
-
-    if (!careersUrl) return null;
-
-    // Step 2: Navigate to careers page
-    if (page.url() !== careersUrl) {
-      await page.goto(careersUrl, {
-        waitUntil: 'domcontentloaded',
-        timeout: 15_000,
-      });
-      await page.waitForTimeout(1000 + Math.random() * 1000);
-    }
-
-    // Step 3: Detect ATS from page content and iframes
-    const pageContent = await page.content();
-    let atsDetected = 'none';
-
-    for (const [name, pattern] of Object.entries(ATS_PATTERNS)) {
-      if (pattern.test(pageContent) || pattern.test(page.url())) {
-        atsDetected = name;
-        break;
-      }
-    }
-
-    if (atsDetected === 'none' && /docs\.google\.com\/forms/i.test(pageContent)) {
-      atsDetected = 'none (google form)';
-    }
-
-    // Step 4: Extract role titles
-    const extractRolesFn = new Function(`return (${EXTRACT_ROLES_SCRIPT})`)();
-    const roleTitles = await page.evaluate(extractRolesFn) as string[];
-
-    // Step 5: Classify roles by department
-    const roles = roleTitles.map((title) => ({
-      title,
-      department: classifyRole(title),
-    }));
-
-    const roleCounts: Record<string, number> = {};
-    for (const role of roles) {
-      roleCounts[role.department] = (roleCounts[role.department] || 0) + 1;
-    }
-
-    return {
-      careers_url: careersUrl,
-      roles,
-      ats_detected: atsDetected,
-      role_counts_by_dept: roleCounts,
-    };
-  } finally {
-    await browser.close();
   }
+  if (atsDetected === 'none' && /docs\.google\.com\/forms/i.test(html)) {
+    atsDetected = 'none (google form)';
+  }
+
+  // Extract and classify roles
+  const roleTitles = extractRoleTitles($);
+  const roles = roleTitles.map((title) => ({
+    title,
+    department: classifyRole(title),
+  }));
+
+  const roleCounts: Record<string, number> = {};
+  for (const role of roles) {
+    roleCounts[role.department] = (roleCounts[role.department] || 0) + 1;
+  }
+
+  return {
+    careers_url: careersUrl,
+    roles,
+    ats_detected: atsDetected,
+    role_counts_by_dept: roleCounts,
+  };
 }
