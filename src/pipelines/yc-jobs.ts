@@ -3,6 +3,7 @@ import {
   jobIdExists,
   insertJobListings,
   insertDedupLog,
+  getJobListingCount,
 } from '../db/supabase';
 import type { YCJobListing } from '../types';
 
@@ -12,14 +13,13 @@ const USER_AGENT =
 const YC_JOBS_URL = 'https://www.ycombinator.com/jobs';
 const YC_COMPANIES_API = 'https://yc-oss.github.io/api/companies/all.json';
 
-/**
- * Max company pages to scrape per run. At ~1s delay per page, 3 pages
- * keeps the function well within Vercel's 60s timeout even with the
- * main /jobs fetch + API fetch overhead.
- */
-const MAX_PAGES_PER_RUN = 3;
+/** Incremental runs scrape this many company pages. */
+const MAX_PAGES_INCREMENTAL = 3;
 
-/** Stop scraping once we hit this many consecutive known job IDs. */
+/** If DB has fewer than this many rows, run a full baseline scrape. */
+const BASELINE_THRESHOLD = 50;
+
+/** Stop processing once we hit this many consecutive known job IDs. */
 const DEDUP_STOP_THRESHOLD = 5;
 
 // ── Keyword matching ──
@@ -130,10 +130,6 @@ function extractJobsFromHtml(html: string): RawJob[] {
   }));
 }
 
-/**
- * Convert YC's relative time strings ("5 days", "about 3 hours",
- * "over 1 year") to an ISO timestamp by subtracting from now.
- */
 function relativeTimeToISO(text: string): string {
   const now = Date.now();
   const num = parseInt(text.replace(/[^0-9]/g, '')) || 1;
@@ -143,11 +139,9 @@ function relativeTimeToISO(text: string): string {
   if (text.includes('month')) return new Date(now - num * 30 * 24 * 60 * 60 * 1000).toISOString();
   if (text.includes('year')) return new Date(now - num * 365 * 24 * 60 * 60 * 1000).toISOString();
 
-  // Fallback: use current time
   return new Date(now).toISOString();
 }
 
-/** Sort batch strings so newest batches come first. */
 function batchSortKey(batch: string): number {
   const match = batch.match(/(Winter|Summer|Fall|Spring)\s+(\d{4})/);
   if (!match) return 0;
@@ -165,21 +159,15 @@ interface YCCompany {
 }
 
 /**
- * Scrape YC job listings from two sources:
+ * Scrape YC job listings.
  *
- * 1. Main /jobs page — 20 featured listings (1 request)
- * 2. YC OSS API → top MAX_PAGES_PER_RUN company pages sorted by newest
- *    batch (1s delay between requests)
- *
- * Fits within Vercel's 60s timeout. Over multiple daily runs, newer
- * companies get covered first. After the first full baseline, subsequent
- * runs only process new jobs via incremental dedup.
+ * @param maxPages — how many company pages to scrape (pass Infinity for all)
  */
-export async function scrapeYCJobs(): Promise<RawJob[]> {
+export async function scrapeYCJobs(maxPages: number = MAX_PAGES_INCREMENTAL): Promise<RawJob[]> {
   const allJobs = new Map<string, RawJob>();
 
   // Source 1: Main /jobs page
-  console.log(`Fetching ${YC_JOBS_URL}...`);
+  console.log(`[SCRAPE] Fetching ${YC_JOBS_URL}...`);
   try {
     const res = await fetch(YC_JOBS_URL, {
       headers: { 'User-Agent': USER_AGENT },
@@ -188,14 +176,14 @@ export async function scrapeYCJobs(): Promise<RawJob[]> {
     if (res.ok) {
       const jobs = extractJobsFromHtml(await res.text());
       for (const j of jobs) allJobs.set(j.jobId, j);
-      console.log(`Main page: ${jobs.length} jobs`);
+      console.log(`[SCRAPE] Main page: ${jobs.length} jobs`);
     }
   } catch (err) {
-    console.error('Failed to fetch main jobs page:', err);
+    console.error('[SCRAPE] Failed to fetch main jobs page:', err);
   }
 
-  // Source 2: Company pages for newest hiring companies
-  console.log(`Fetching YC companies API...`);
+  // Source 2: Company pages
+  console.log(`[SCRAPE] Fetching YC companies API...`);
   try {
     const res = await fetch(YC_COMPANIES_API, { signal: AbortSignal.timeout(15_000) });
     if (!res.ok) throw new Error(`API returned ${res.status}`);
@@ -205,10 +193,13 @@ export async function scrapeYCJobs(): Promise<RawJob[]> {
       .filter((c) => c.isHiring)
       .sort((a, b) => batchSortKey(a.batch) - batchSortKey(b.batch));
 
-    const batch = hiring.slice(0, MAX_PAGES_PER_RUN);
-    console.log(`${hiring.length} hiring companies, scraping ${batch.length} newest...`);
+    const pageCount = Math.min(hiring.length, maxPages);
+    const isFullScrape = pageCount === hiring.length;
+    console.log(`[SCRAPE] ${hiring.length} hiring companies, scraping ${pageCount}${isFullScrape ? ' (FULL BASELINE)' : ' (incremental)'}...`);
 
-    for (const company of batch) {
+    const batch = hiring.slice(0, pageCount);
+    for (let i = 0; i < batch.length; i++) {
+      const company = batch[i];
       const url = `https://www.ycombinator.com/companies/${company.slug}`;
       try {
         const pageRes = await fetch(url, {
@@ -222,6 +213,11 @@ export async function scrapeYCJobs(): Promise<RawJob[]> {
           if (!allJobs.has(j.jobId)) allJobs.set(j.jobId, j);
         }
 
+        // Log progress every 50 pages during full baseline
+        if (isFullScrape && (i + 1) % 50 === 0) {
+          console.log(`[SCRAPE] Progress: ${i + 1}/${pageCount} companies, ${allJobs.size} unique jobs`);
+        }
+
         // 1s delay between requests
         await new Promise((r) => setTimeout(r, 1000));
       } catch {
@@ -229,9 +225,9 @@ export async function scrapeYCJobs(): Promise<RawJob[]> {
       }
     }
 
-    console.log(`Total after company pages: ${allJobs.size} unique jobs`);
+    console.log(`[SCRAPE] Total: ${allJobs.size} unique jobs from ${pageCount} company pages`);
   } catch (err) {
-    console.error('Failed to process YC companies:', err);
+    console.error('[SCRAPE] Failed to process YC companies:', err);
   }
 
   return Array.from(allJobs.values());
@@ -240,22 +236,34 @@ export async function scrapeYCJobs(): Promise<RawJob[]> {
 // ── Incremental match + queue ──
 
 /**
- * Scrape YC jobs and incrementally process only new listings.
+ * Scrape YC jobs and process new listings.
  *
- * For each job:
- *   1. Check if job_id already exists in Supabase
- *   2. If we hit DEDUP_STOP_THRESHOLD consecutive known IDs → stop
- *      (we've caught up to previously seen jobs)
- *   3. If new → run keyword matching, queue for insert
+ * If the database has < BASELINE_THRESHOLD rows, scrape ALL hiring
+ * company pages to build a full baseline (this will take ~30 min
+ * and must be run locally, not on Vercel).
  *
- * On the very first run (empty DB), all jobs are new → full baseline.
+ * Otherwise, scrape only MAX_PAGES_INCREMENTAL pages and stop
+ * after DEDUP_STOP_THRESHOLD consecutive known job IDs.
  */
 export async function queueNewListings(): Promise<YCJobListing[]> {
-  const rawJobs = await scrapeYCJobs();
-  console.log(`[DEBUG] Scraped ${rawJobs.length} total jobs`);
+  // Determine if we need a full baseline
+  let existingCount = 0;
+  try {
+    existingCount = await getJobListingCount();
+  } catch (err) {
+    console.error('[QUEUE] Failed to get listing count, assuming incremental:', err);
+  }
 
-  // Log first 5 raw titles so we can see what we're working with
-  console.log('[DEBUG] First 5 raw job titles:');
+  const isBaseline = existingCount < BASELINE_THRESHOLD;
+  const maxPages = isBaseline ? Infinity : MAX_PAGES_INCREMENTAL;
+
+  console.log(`[QUEUE] DB has ${existingCount} rows. Mode: ${isBaseline ? 'FULL BASELINE' : 'incremental (3 pages)'}`);
+
+  const rawJobs = await scrapeYCJobs(maxPages);
+  console.log(`[QUEUE] Scraped ${rawJobs.length} total jobs`);
+
+  // Log first 5 raw titles
+  console.log('[QUEUE] Sample jobs:');
   for (const job of rawJobs.slice(0, 5)) {
     console.log(`  id=${job.jobId} | "${job.roleTitle}" | ${job.companyName} (${job.companyBatch})`);
   }
@@ -275,38 +283,30 @@ export async function queueNewListings(): Promise<YCJobListing[]> {
     try {
       exists = await jobIdExists(job.jobId);
     } catch (err) {
-      console.error(`[DEBUG] Supabase jobIdExists error for ${job.jobId}:`, err);
-      // On Supabase error, treat as not existing so we don't silently skip
-      exists = false;
+      console.error(`[QUEUE] Supabase jobIdExists error for ${job.jobId}:`, err);
     }
 
     if (exists) {
       skippedDedup++;
       consecutiveExisting++;
-      if (consecutiveExisting >= DEDUP_STOP_THRESHOLD) {
-        console.log(`[DEBUG] Hit ${DEDUP_STOP_THRESHOLD} consecutive known jobs — caught up, stopping`);
+      // Only apply early-stop on incremental runs, not baseline
+      if (!isBaseline && consecutiveExisting >= DEDUP_STOP_THRESHOLD) {
+        console.log(`[QUEUE] Hit ${DEDUP_STOP_THRESHOLD} consecutive known jobs — caught up, stopping`);
         break;
       }
       continue;
     }
 
-    // New job resets the consecutive counter
     consecutiveExisting = 0;
     newCount++;
 
     const keyword = matchKeywords(job.roleTitle);
-    const normTitle = job.roleTitle.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
-
     if (!keyword) {
       skippedKeyword++;
-      // Log why the first few non-matches fail
-      if (skippedKeyword <= 3) {
-        console.log(`[DEBUG] No keyword match: "${job.roleTitle}" (normalised: "${normTitle}")`);
-      }
       continue;
     }
 
-    console.log(`[DEBUG] ✓ MATCHED: "${job.roleTitle}" → ${keyword}`);
+    console.log(`[QUEUE] ✓ MATCHED: "${job.roleTitle}" (${job.companyName}) → ${keyword}`);
 
     matched.push({
       job_id: job.jobId,
@@ -320,29 +320,27 @@ export async function queueNewListings(): Promise<YCJobListing[]> {
     });
   }
 
-  console.log(`[DEBUG] Summary: ${rawJobs.length} scraped, ${newCount} new, ${skippedDedup} already in DB, ${skippedKeyword} no keyword match, ${matched.length} matched`);
+  console.log(`[QUEUE] Summary: ${rawJobs.length} scraped, ${newCount} new, ${skippedDedup} deduped, ${skippedKeyword} no keyword, ${matched.length} matched`);
 
   if (matched.length > 0) {
-    console.log(`[DEBUG] Inserting ${matched.length} rows to yc_job_listings...`);
+    console.log(`[QUEUE] Inserting ${matched.length} rows...`);
     try {
       const now = new Date().toISOString();
       await insertJobListings(matched.map((m) => ({ ...m, first_seen_at: now })));
-      console.log(`[DEBUG] Insert succeeded`);
+      console.log(`[QUEUE] Insert succeeded: ${matched.length} rows`);
     } catch (err) {
-      console.error(`[DEBUG] Supabase insertJobListings FAILED:`, err);
+      console.error(`[QUEUE] Supabase insert FAILED:`, err);
     }
 
     for (const m of matched) {
       try {
         await insertDedupLog('yc_jobs', m.job_id);
       } catch (err) {
-        console.error(`[DEBUG] Supabase insertDedupLog FAILED for ${m.job_id}:`, err);
+        console.error(`[QUEUE] Supabase dedup log FAILED for ${m.job_id}:`, err);
       }
     }
-
-    console.log(`Inserted ${matched.length} new matched listings`);
   } else {
-    console.log('[DEBUG] No matched listings to insert');
+    console.log('[QUEUE] No matched listings to insert');
   }
 
   return matched;

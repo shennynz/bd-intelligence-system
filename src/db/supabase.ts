@@ -45,6 +45,14 @@ export async function insertJobListings(
   if (error) throw error;
 }
 
+export async function getJobListingCount(): Promise<number> {
+  const { count, error } = await getSupabase()
+    .from('yc_job_listings')
+    .select('*', { count: 'exact', head: true });
+  if (error) throw error;
+  return count ?? 0;
+}
+
 export async function getUnsentJobListings() {
   const { data, error } = await getSupabase()
     .from('yc_job_listings')
