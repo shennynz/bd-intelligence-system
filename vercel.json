@@ -1,4 +1,10 @@
 {
+  "functions": {
+    "api/cron.ts": {
+      "maxDuration": 60,
+      "includeFiles": "src/**"
+    }
+  },
   "crons": [
     { "path": "/api/cron?pipeline=yc-jobs",    "schedule": "0 */2 * * *" },
     { "path": "/api/cron?pipeline=hn-funding", "schedule": "0 */2 * * *" },
