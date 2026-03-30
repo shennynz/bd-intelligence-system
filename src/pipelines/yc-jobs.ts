@@ -235,23 +235,39 @@ export async function scrapeYCJobs(): Promise<RawJob[]> {
  */
 export async function queueNewListings(): Promise<YCJobListing[]> {
   const rawJobs = await scrapeYCJobs();
-  console.log(`Scraped ${rawJobs.length} total jobs`);
+  console.log(`[DEBUG] Scraped ${rawJobs.length} total jobs`);
+
+  // Log first 5 raw titles so we can see what we're working with
+  console.log('[DEBUG] First 5 raw job titles:');
+  for (const job of rawJobs.slice(0, 5)) {
+    console.log(`  id=${job.jobId} | "${job.roleTitle}" | ${job.companyName} (${job.companyBatch})`);
+  }
 
   const matched: YCJobListing[] = [];
   const seenJobIds = new Set<string>();
   let newCount = 0;
+  let skippedDedup = 0;
+  let skippedKeyword = 0;
   let consecutiveExisting = 0;
 
   for (const job of rawJobs) {
     if (seenJobIds.has(job.jobId)) continue;
     seenJobIds.add(job.jobId);
 
-    const exists = await jobIdExists(job.jobId);
+    let exists = false;
+    try {
+      exists = await jobIdExists(job.jobId);
+    } catch (err) {
+      console.error(`[DEBUG] Supabase jobIdExists error for ${job.jobId}:`, err);
+      // On Supabase error, treat as not existing so we don't silently skip
+      exists = false;
+    }
 
     if (exists) {
+      skippedDedup++;
       consecutiveExisting++;
       if (consecutiveExisting >= DEDUP_STOP_THRESHOLD) {
-        console.log(`Hit ${DEDUP_STOP_THRESHOLD} consecutive known jobs — caught up, stopping`);
+        console.log(`[DEBUG] Hit ${DEDUP_STOP_THRESHOLD} consecutive known jobs — caught up, stopping`);
         break;
       }
       continue;
@@ -262,7 +278,18 @@ export async function queueNewListings(): Promise<YCJobListing[]> {
     newCount++;
 
     const keyword = matchKeywords(job.roleTitle);
-    if (!keyword) continue;
+    const normTitle = job.roleTitle.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
+
+    if (!keyword) {
+      skippedKeyword++;
+      // Log why the first few non-matches fail
+      if (skippedKeyword <= 3) {
+        console.log(`[DEBUG] No keyword match: "${job.roleTitle}" (normalised: "${normTitle}")`);
+      }
+      continue;
+    }
+
+    console.log(`[DEBUG] ✓ MATCHED: "${job.roleTitle}" → ${keyword}`);
 
     matched.push({
       job_id: job.jobId,
@@ -276,16 +303,29 @@ export async function queueNewListings(): Promise<YCJobListing[]> {
     });
   }
 
-  const isFirstRun = consecutiveExisting === 0 && newCount === rawJobs.length;
-  console.log(`${newCount} new jobs found${isFirstRun ? ' (first run — full baseline)' : ' (incremental)'}`);
+  console.log(`[DEBUG] Summary: ${rawJobs.length} scraped, ${newCount} new, ${skippedDedup} already in DB, ${skippedKeyword} no keyword match, ${matched.length} matched`);
 
   if (matched.length > 0) {
-    const now = new Date().toISOString();
-    await insertJobListings(matched.map((m) => ({ ...m, first_seen_at: now })));
-    for (const m of matched) await insertDedupLog('yc_jobs', m.job_id);
+    console.log(`[DEBUG] Inserting ${matched.length} rows to yc_job_listings...`);
+    try {
+      const now = new Date().toISOString();
+      await insertJobListings(matched.map((m) => ({ ...m, first_seen_at: now })));
+      console.log(`[DEBUG] Insert succeeded`);
+    } catch (err) {
+      console.error(`[DEBUG] Supabase insertJobListings FAILED:`, err);
+    }
+
+    for (const m of matched) {
+      try {
+        await insertDedupLog('yc_jobs', m.job_id);
+      } catch (err) {
+        console.error(`[DEBUG] Supabase insertDedupLog FAILED for ${m.job_id}:`, err);
+      }
+    }
+
     console.log(`Inserted ${matched.length} new matched listings`);
   } else {
-    console.log('No new matched listings');
+    console.log('[DEBUG] No matched listings to insert');
   }
 
   return matched;
