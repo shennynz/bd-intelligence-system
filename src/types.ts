@@ -9,6 +9,9 @@ export interface YCJobListing {
   role_url: string;
   matched_keyword: string;
   posted_at: string;
+  location: string;
+  salary_range: string;
+  min_experience: string;
 }
 
 // ── Pipeline 2 + 3: Intel Card ──

@@ -77,6 +77,9 @@ const INSERT_BATCH_SIZE = 100;
     matched_keyword: string;
     posted_at: string;
     first_seen_at: string;
+    location: string;
+    salary_range: string;
+    min_experience: string;
   }[] = [];
 
   const startTime = Date.now();
@@ -120,6 +123,9 @@ const INSERT_BATCH_SIZE = 100;
           matched_keyword: keyword,
           posted_at: job.postedAt,
           first_seen_at: new Date().toISOString(),
+          location: job.location,
+          salary_range: job.salaryRange,
+          min_experience: job.minExperience,
         });
       }
 

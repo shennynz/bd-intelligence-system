@@ -81,6 +81,9 @@ interface RawJob {
   roleTitle: string;
   roleUrl: string;
   postedAt: string;
+  location: string;
+  salaryRange: string;
+  minExperience: string;
 }
 
 interface YCEmbeddedJob {
@@ -91,6 +94,9 @@ interface YCEmbeddedJob {
   companyBatchName: string | null;
   companyUrl: string;
   lastActive: string;
+  location: string;
+  salaryRange: string;
+  minExperience: string;
   [key: string]: unknown;
 }
 
@@ -123,6 +129,9 @@ export function extractJobsFromHtml(html: string): RawJob[] {
     roleTitle: j.title || '',
     roleUrl: j.url ? `https://www.ycombinator.com${j.url}` : '',
     postedAt: relativeTimeToISO(j.lastActive || ''),
+    location: j.location || '',
+    salaryRange: j.salaryRange || '',
+    minExperience: j.minExperience || '',
   }));
 }
 
@@ -278,6 +287,9 @@ export async function queueNewListings(): Promise<YCJobListing[]> {
       role_url: job.roleUrl,
       matched_keyword: keyword,
       posted_at: job.postedAt,
+      location: job.location,
+      salary_range: job.salaryRange,
+      min_experience: job.minExperience,
     });
   }
 

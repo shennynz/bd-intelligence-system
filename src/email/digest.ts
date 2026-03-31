@@ -37,14 +37,20 @@ export async function sendDigestEmail(subjectOverride?: string): Promise<void> {
       const companySlug = l.company_url
         ? l.company_url
         : `https://www.ycombinator.com/companies/${l.company_name.toLowerCase().replace(/\s+/g, '-')}`;
-      return [
+      const lines = [
         '────────────────────────────────────',
         `${l.company_name} (${l.company_batch || '??'}) — ${l.role_title}`,
+      ];
+      if (l.location) lines.push(`📍 ${l.location}`);
+      if (l.salary_range) lines.push(`💰 ${l.salary_range}`);
+      if (l.min_experience) lines.push(`🎯 ${l.min_experience} experience`);
+      lines.push(
         `Posted: ${postedAgo}`,
         `→ YC profile: ${companySlug}`,
         `→ Job listing: ${l.role_url}`,
         `Matched keyword: ${l.matched_keyword}`,
-      ].join('\n');
+      );
+      return lines.join('\n');
     })
     .join('\n\n');
 
@@ -64,16 +70,26 @@ export async function sendDigestEmail(subjectOverride?: string): Promise<void> {
 
   const resend = new Resend(apiKey);
 
-  await resend.emails.send({
+  console.log(`Calling Resend API (body length: ${fullBody.length} chars)...`);
+
+  const { data, error } = await resend.emails.send({
     from: fromEmail,
     to: toEmail,
     subject,
     text: fullBody,
   });
 
-  console.log(`Digest email sent: "${subject}"`);
+  console.log('Resend response:', JSON.stringify({ data, error }));
 
-  // Mark ALL unsent listings as alerted (not just the 50 displayed)
+  if (error || !data?.id) {
+    throw new Error(
+      `Resend failed: ${error?.message || 'no email ID returned'} (${JSON.stringify(error)})`
+    );
+  }
+
+  console.log(`Digest email sent: "${subject}" (id: ${data.id})`);
+
+  // Only mark as alerted after confirmed send
   await markAllUnsentAsAlerted();
   console.log(`Marked ${totalCount} listings as alerted`);
 }

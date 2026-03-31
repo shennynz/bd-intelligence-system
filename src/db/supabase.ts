@@ -38,6 +38,9 @@ export async function insertJobListings(
     matched_keyword: string;
     posted_at: string;
     first_seen_at: string;
+    location: string;
+    salary_range: string;
+    min_experience: string;
   }[]
 ): Promise<void> {
   if (rows.length === 0) return;
